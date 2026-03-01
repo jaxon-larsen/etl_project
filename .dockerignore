@@ -1,0 +1,6 @@
+postgres_data/
+clickhouse_data/
+venv/
+.git/
+.env
+sql/

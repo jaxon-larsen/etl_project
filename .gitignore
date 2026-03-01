@@ -1,0 +1,22 @@
+# Database Data (Locked/Heavy)
+postgres_data/
+clickhouse_data/
+
+# Python Virtual Environment
+venv/
+__pycache__/
+*.pyc
+
+# Airflow Logs & Metadata
+logs/
+airflow.db
+airflow.cfg
+webserver_config.py
+unittests.cfg
+
+# Secrets
+.env
+
+# OS-specific
+.DS_Store
+.github/
