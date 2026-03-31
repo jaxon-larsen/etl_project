@@ -55,6 +55,19 @@ services:
     environment:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_source/airflow_meta
+      - AIRFLOW__CORE__PARALLELISM=4
+      - AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG=1
+      - AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG=1
+      - AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL=30
+      - AIRFLOW__SCHEDULER__MAX_TIS_PER_QUERY=4
+      - AIRFLOW__WEBSERVER__WORKERS=2
+      - AIRFLOW__WEBSERVER__WORKER_REFRESH_INTERVAL=1800
+      - INSTRUMENT_COUNT=${INSTRUMENT_COUNT:-50}
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD}
     ports:
       - "8080:8080"
     volumes:
@@ -67,3 +80,5 @@ services:
       resources:
         limits:
           memory: 2gb
+        reservations:
+          memory: 1gb

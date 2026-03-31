@@ -1,5 +1,5 @@
 import sys
-sys.path.append('/opt/airflow')
+sys.path.append('/opt/airflow/dags')
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator

@@ -33,23 +33,84 @@ def _pg_conn():
         conn.close()
 
 def scout_instruments():
-    """Finds UUIDs for target instruments."""
-    target_instruments = ["Sitar", "Synthesizer", "Bagpipes", "Electric Guitar"]
+    """Discovers popular instruments from MusicBrainz by usage/recording count."""
+    # Configurable via environment, default to 50 popular instruments
+    target_count = int(os.environ.get("INSTRUMENT_COUNT", "50"))
+    page_size = 100
+    offset = 0
     instrument_map = {}
     
-    logger.info(f"Scouting {len(target_instruments)} instruments...")
-    for instrument in target_instruments:
+    # Optional: Prioritize specific instruments to ensure they're included
+    priority_instruments = [
+        "Piano", "Guitar", "Drums", "Bass", "Violin", 
+        "Synthesizer", "Saxophone", "Trumpet"
+    ]
+    
+    logger.info(f"Discovering top {target_count} popular instruments...")
+    
+    # First, explicitly scout priority instruments to ensure they're captured
+    for inst_name in priority_instruments:
+        if len(instrument_map) >= target_count:
+            break
         try:
-            result = musicbrainzngs.search_instruments(instrument=instrument, limit=1)
-            if result['instrument-list']:
-                inst_data = result['instrument-list'][0]
-                instrument_map[instrument] = inst_data['id']
-                logger.info(f"Found {instrument}: {inst_data['id']}")
+            result = musicbrainzngs.search_instruments(instrument=inst_name, limit=1)
+            if result.get('instrument-list'):
+                inst = result['instrument-list'][0]
+                name = inst.get('name', inst_name)
+                uuid = inst.get('id')
+                if uuid and name not in [k for k in instrument_map.keys()]:
+                    instrument_map[name] = uuid
+                    logger.info(f"Priority instrument #{len(instrument_map)}: {name}")
         except Exception as e:
-            logger.error(f"Error scouting {instrument}: {e}")
-            raise
+            logger.warning(f"Could not find priority instrument {inst_name}: {e}")
         finally:
             time.sleep(1)
+    
+    # Then discover additional popular instruments via pagination
+    while len(instrument_map) < target_count:
+        try:
+            # Wildcard search returns instruments sorted by popularity
+            result = musicbrainzngs.search_instruments(
+                query="*",
+                limit=page_size,
+                offset=offset
+            )
+            
+            instrument_list = result.get('instrument-list', [])
+            if not instrument_list:
+                logger.info("No more instruments available from MusicBrainz")
+                break
+            
+            for inst in instrument_list:
+                name = inst.get('name')
+                uuid = inst.get('id')
+                
+                # Skip if already added or missing required fields
+                if not name or not uuid or name in instrument_map:
+                    continue
+                
+                # Optional: Filter out non-traditional instruments
+                # (uncomment to exclude things like "handclaps", "orchestra")
+                # skip_terms = ['unspecified', 'other', 'unknown']
+                # if any(term in name.lower() for term in skip_terms):
+                #     continue
+                
+                instrument_map[name] = uuid
+                logger.info(f"Discovered #{len(instrument_map)}: {name}")
+                
+                if len(instrument_map) >= target_count:
+                    break
+            
+            offset += page_size
+            
+        except Exception as e:
+            logger.error(f"Error discovering instruments at offset {offset}: {e}")
+            # Don't fail completely, just stop discovery
+            break
+        finally:
+            time.sleep(1)
+    
+    logger.info(f"Successfully discovered {len(instrument_map)} instruments")
     return instrument_map
 
 def save_instruments(instrument_map):
@@ -73,67 +134,163 @@ def save_instruments(instrument_map):
     logger.info(f"Successfully saved {len(instrument_map)} instruments to Postgres.")
 
 def harvest_recordings():
-    """Fetches recordings using 'Earliest Release' logic."""
-    countries = ['US', 'GB', 'IN', 'JP', 'BR']
+    """Fetches recordings using 'Earliest Release' logic with pagination and checkpointing."""
+    MAX_RECORDINGS_PER_INSTRUMENT = 10000
+    PAGE_SIZE = 100
     
+    # Initialize tables
     with _pg_conn() as conn:
         cur = conn.cursor()
-
-        # Create table if it doesn't exist, then truncate to prevent duplicates on re-runs
         cur.execute("""
             CREATE TABLE IF NOT EXISTS recording_data (
-                instrument_name TEXT,
+                recording_id    TEXT NOT NULL,
+                instrument_name TEXT NOT NULL,
                 recording_name  TEXT,
                 release_year    INT,
-                country_code    TEXT
+                country_code    TEXT,
+                PRIMARY KEY (recording_id, instrument_name)
             );
         """)
-        cur.execute("TRUNCATE recording_data;")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS harvest_progress (
+                instrument_name TEXT PRIMARY KEY,
+                recordings_fetched INT DEFAULT 0,
+                last_offset INT DEFAULT 0,
+                completed BOOLEAN DEFAULT FALSE,
+                last_updated TIMESTAMP DEFAULT NOW()
+            );
+        """)
         conn.commit()
-
         cur.execute("SELECT instrument_name, mb_uuid FROM target_instruments;")
         scouted = cur.fetchall()
+        cur.close()
         
-        if not scouted:
-            logger.warning("No instruments found in target_instruments table. Skipping harvest.")
-            cur.close()
-            return
+    if not scouted:
+        logger.warning("No instruments found in target_instruments table. Skipping harvest.")
+        return
 
-        logger.info(f"Found {len(scouted)} instruments to harvest.")
-        for inst_name, inst_uuid in scouted:
-            for country in countries:
-                logger.info(f"Harvesting {inst_name} in {country}...")
-                query = f"iid:{inst_uuid} AND country:{country}"
+    logger.info(f"Found {len(scouted)} instruments to harvest (max {MAX_RECORDINGS_PER_INSTRUMENT} per instrument).")
+    
+    for inst_name, inst_uuid in scouted:
+        # Use a fresh connection for each instrument to avoid long-lived connections
+        with _pg_conn() as conn:
+            cur = conn.cursor()
+            # Check if already completed
+            cur.execute("""
+                SELECT recordings_fetched, last_offset, completed 
+                FROM harvest_progress 
+                WHERE instrument_name = %s
+            """, (inst_name,))
+            progress = cur.fetchone()
+            
+            if progress and progress[2]:  # completed = True
+                logger.info(f"Skipping {inst_name} - already completed with {progress[0]} recordings.")
+                cur.close()
+                continue
+            
+            start_offset = progress[1] if progress else 0
+            total_fetched = progress[0] if progress else 0
+            
+            logger.info(f"Harvesting {inst_name} starting at offset {start_offset}...")
+            
+            offset = start_offset
+            while offset < MAX_RECORDINGS_PER_INSTRUMENT:
+                query = f"iid:{inst_uuid}"
+                
                 try:
-                    result = musicbrainzngs.search_recordings(query=query, limit=50)
-
-                    for rec in result.get('recording-list', []):
+                    result = musicbrainzngs.search_recordings(
+                        query=query, 
+                        limit=PAGE_SIZE, 
+                        offset=offset
+                    )
+                    
+                    recording_list = result.get('recording-list', [])
+                    if not recording_list:
+                        logger.info(f"No more recordings found for {inst_name} at offset {offset}")
+                        break
+                    
+                    # Batch insert recordings
+                    batch_data = []
+                    for rec in recording_list:
+                        rec_id = rec.get('id')
+                        rec_title = rec.get('title', 'Unknown')
+                        
                         # Find the earliest year across all releases
                         years = []
+                        countries = []
                         for release in rec.get('release-list', []):
                             date_str = release.get('date', '')
                             if date_str and len(date_str) >= 4:
                                 try:
                                     years.append(int(date_str[:4]))
                                 except ValueError:
-                                    continue
+                                    pass
+                            
+                            # Get country from release
+                            country = release.get('country', None)
+                            if country:
+                                countries.append(country)
                         
                         earliest_year = min(years) if years else None
-
-                        cur.execute(
+                        # Use first country found, or None
+                        country_code = countries[0] if countries else None
+                        
+                        batch_data.append((rec_id, inst_name, rec_title, earliest_year, country_code))
+                    
+                    # Bulk insert with ON CONFLICT to handle duplicates
+                    if batch_data:
+                        cur.executemany(
                             """
-                            INSERT INTO recording_data (instrument_name, recording_name, release_year, country_code)
-                            VALUES (%s, %s, %s, %s)
-                            """, (inst_name, rec['title'], earliest_year, country)
+                            INSERT INTO recording_data (recording_id, instrument_name, recording_name, release_year, country_code)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (recording_id, instrument_name) DO NOTHING
+                            """, batch_data
                         )
+                        conn.commit()
+                    
+                    fetched_count = len(recording_list)
+                    total_fetched += fetched_count
+                    offset += PAGE_SIZE
+                    
+                    # Update progress checkpoint
+                    cur.execute("""
+                        INSERT INTO harvest_progress (instrument_name, recordings_fetched, last_offset, completed, last_updated)
+                        VALUES (%s, %s, %s, %s, NOW())
+                        ON CONFLICT (instrument_name) 
+                        DO UPDATE SET 
+                            recordings_fetched = EXCLUDED.recordings_fetched,
+                            last_offset = EXCLUDED.last_offset,
+                            completed = EXCLUDED.completed,
+                            last_updated = NOW()
+                    """, (inst_name, total_fetched, offset, False))
                     conn.commit()
+                    
+                    logger.info(f"{inst_name}: fetched {fetched_count} recordings (total: {total_fetched}, offset: {offset})")
+                    
+                    # Stop if we got less than PAGE_SIZE (no more results)
+                    if fetched_count < PAGE_SIZE:
+                        logger.info(f"Reached end of results for {inst_name}")
+                        break
+                
                 except Exception as e:
-                    logger.error(f"Harvesting error for {inst_name} in {country}: {e}")
-                    raise
+                    logger.error(f"Error harvesting {inst_name} at offset {offset}: {e}")
+                    # Don't raise - continue to next instrument
+                    break
+                
                 finally:
-                    time.sleep(1)
-
-        cur.close()
+                    time.sleep(1)  # Rate limiting
+            
+            # Mark as completed
+            cur.execute("""
+                UPDATE harvest_progress 
+                SET completed = TRUE, last_updated = NOW()
+                WHERE instrument_name = %s
+            """, (inst_name,))
+            conn.commit()
+            cur.close()
+            
+            logger.info(f"Completed {inst_name}: {total_fetched} total recordings harvested")
+    
     logger.info("Harvesting complete!")
 
 def move_to_clickhouse():
@@ -155,7 +312,7 @@ def move_to_clickhouse():
             cur = conn.cursor()
             
             # Get total count for logging
-            cur.execute("SELECT COUNT(*) FROM recording_data WHERE release_year IS NOT NULL;")
+            cur.execute("SELECT COUNT(DISTINCT recording_id) FROM recording_data WHERE release_year IS NOT NULL;")
             total_rows = cur.fetchone()[0]
             
             if total_rows == 0:
@@ -163,13 +320,15 @@ def move_to_clickhouse():
                 cur.close()
                 return
             
-            logger.info(f"Moving {total_rows} rows to ClickHouse in batches...")
+            logger.info(f"Moving {total_rows} unique recordings to ClickHouse in batches...")
             
-            # Use server-side cursor for batched fetching
+            # Use DISTINCT to avoid duplicate recordings in ClickHouse
             cur.execute("""
-                SELECT instrument_name, recording_name, release_year, country_code 
+                SELECT DISTINCT ON (recording_id) 
+                    instrument_name, recording_name, release_year, country_code 
                 FROM recording_data 
-                WHERE release_year IS NOT NULL;
+                WHERE release_year IS NOT NULL
+                ORDER BY recording_id, instrument_name;
             """)
             
             batch_size = 1000
